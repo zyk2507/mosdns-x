@@ -8,4 +8,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/IrineSistiana/mosdns/v4
+        - github.com/pmkol/mosdns-x
