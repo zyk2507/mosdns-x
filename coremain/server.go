@@ -126,7 +126,7 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 
 	var run func() error
 	switch cfg.Protocol {
-	case "", "udp", "quic", "doq":
+	case "", "udp", "quic", "doq", "h3", "doh3":
 		var conn net.PacketConn
 		var err error
 		if cfg.UnixDomainSocket {
@@ -152,6 +152,12 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 				return err
 			}
 			run = func() error { return s.ServeQUIC(l) }
+		case "h3", "doh3":
+			l, err := s.CreateQUICListner(conn, []string{"h3"})
+			if err != nil {
+				return err
+			}
+			run = func() error { return s.ServeH3(l) }
 		}
 	case "tcp", "http", "tls", "dot", "https", "doh":
 		var l net.Listener
