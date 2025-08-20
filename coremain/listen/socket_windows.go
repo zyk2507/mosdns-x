@@ -7,9 +7,12 @@ import (
 	"syscall"
 )
 
-func CreateListenConfig() net.ListenConfig {
+func CreateListenConfig(uds bool) net.ListenConfig {
 	return net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
+			if uds {
+				return nil
+			}
 			var e error
 			err := c.Control(func(fd uintptr) {
 				e = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)

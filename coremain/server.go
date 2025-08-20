@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -116,24 +118,62 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 		return proxyproto.REQUIRE, nil
 	}
 
-	config := listen.CreateListenConfig()
+	config := listen.CreateListenConfig(cfg.UnixDomainSocket)
+	abstract := strings.HasPrefix(cfg.Addr, "@")
+	ctx := context.Background()
 
 	var run func() error
 	switch cfg.Protocol {
 	case "", "udp":
-		conn, err := config.ListenPacket(context.Background(), "udp", cfg.Addr)
+		var conn net.PacketConn
+		var err error
+		if cfg.UnixDomainSocket {
+			if !abstract {
+				os.Remove(cfg.Addr)
+			}
+			conn, err = config.ListenPacket(ctx, "unixgram", cfg.Addr)
+			if !abstract {
+				os.Chmod(cfg.Addr, 0x777)
+			}
+		} else {
+			conn, err = config.ListenPacket(ctx, "udp", cfg.Addr)
+		}
 		if err != nil {
 			return err
 		}
 		run = func() error { return s.ServeUDP(conn) }
 	case "quic", "doq":
-		conn, err := config.ListenPacket(context.Background(), "udp", cfg.Addr)
+		var conn net.PacketConn
+		var err error
+		if cfg.UnixDomainSocket {
+			if !abstract {
+				os.Remove(cfg.Addr)
+			}
+			conn, err = config.ListenPacket(ctx, "unixgram", cfg.Addr)
+			if !abstract {
+				os.Chmod(cfg.Addr, 0x777)
+			}
+		} else {
+			conn, err = config.ListenPacket(ctx, "udp", cfg.Addr)
+		}
 		if err != nil {
 			return err
 		}
 		run = func() error { return s.ServeQUIC(conn) }
 	case "tcp":
-		l, err := config.Listen(context.Background(), "tcp", cfg.Addr)
+		var l net.Listener
+		var err error
+		if cfg.UnixDomainSocket {
+			if !abstract {
+				os.Remove(cfg.Addr)
+			}
+			l, err = config.Listen(ctx, "unix", cfg.Addr)
+			if !abstract {
+				os.Chmod(cfg.Addr, 0x777)
+			}
+		} else {
+			l, err = config.Listen(ctx, "tcp", cfg.Addr)
+		}
 		if err != nil {
 			return err
 		}
@@ -142,7 +182,19 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 		}
 		run = func() error { return s.ServeTCP(l) }
 	case "tls", "dot":
-		l, err := config.Listen(context.Background(), "tcp", cfg.Addr)
+		var l net.Listener
+		var err error
+		if cfg.UnixDomainSocket {
+			if !abstract {
+				os.Remove(cfg.Addr)
+			}
+			l, err = config.Listen(ctx, "unix", cfg.Addr)
+			if !abstract {
+				os.Chmod(cfg.Addr, 0x777)
+			}
+		} else {
+			l, err = config.Listen(ctx, "tcp", cfg.Addr)
+		}
 		if err != nil {
 			return err
 		}
@@ -151,7 +203,19 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 		}
 		run = func() error { return s.ServeTLS(l) }
 	case "http":
-		l, err := config.Listen(context.Background(), "tcp", cfg.Addr)
+		var l net.Listener
+		var err error
+		if cfg.UnixDomainSocket {
+			if !abstract {
+				os.Remove(cfg.Addr)
+			}
+			l, err = config.Listen(ctx, "unix", cfg.Addr)
+			if !abstract {
+				os.Chmod(cfg.Addr, 0x777)
+			}
+		} else {
+			l, err = config.Listen(ctx, "tcp", cfg.Addr)
+		}
 		if err != nil {
 			return err
 		}
@@ -160,7 +224,19 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 		}
 		run = func() error { return s.ServeHTTP(l) }
 	case "https", "doh":
-		l, err := config.Listen(context.Background(), "tcp", cfg.Addr)
+		var l net.Listener
+		var err error
+		if cfg.UnixDomainSocket {
+			if !abstract {
+				os.Remove(cfg.Addr)
+			}
+			l, err = config.Listen(ctx, "unix", cfg.Addr)
+			if !abstract {
+				os.Chmod(cfg.Addr, 0x777)
+			}
+		} else {
+			l, err = config.Listen(ctx, "tcp", cfg.Addr)
+		}
 		if err != nil {
 			return err
 		}

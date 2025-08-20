@@ -6,6 +6,6 @@ import (
 	"net"
 )
 
-func CreateListenConfig() net.ListenConfig {
+func CreateListenConfig(_ bool) net.ListenConfig {
 	return net.ListenConfig{}
 }

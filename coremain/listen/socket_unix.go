@@ -9,9 +9,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func CreateListenConfig() net.ListenConfig {
+func CreateListenConfig(uds bool) net.ListenConfig {
 	return net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
+			if uds {
+				return nil
+			}
 			var e error
 			err := c.Control(func(fd uintptr) {
 				e = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
