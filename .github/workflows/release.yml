@@ -17,7 +17,7 @@ jobs:
         uses: actions/setup-go@v5.5.0
         with:
           go-version: ${{steps.go.outputs.version}}
-          cache: true
+          cache: false
 
       - uses: actions/checkout@v4.2.2
         with:
