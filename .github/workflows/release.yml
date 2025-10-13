@@ -21,6 +21,7 @@ jobs:
 
       - uses: actions/checkout@v4.2.2
         with:
+          repository: zyk2507/mosdns-x
           fetch-depth: 0
 
       - name: Set up Python
@@ -39,6 +40,7 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v1
         with:
+          repository: zyk2507/mosdns-x
           name: Mosdns-x ${{ env.TAG_NAME }}
           tag_name: ${{ env.TAG_NAME }}
           files: './release/mosdns*.zip'

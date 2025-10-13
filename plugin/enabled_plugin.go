@@ -30,6 +30,7 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ecs"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/edns0_filter"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/fast_forward"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/fastest_forward"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/hosts"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ipset"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/marker"
