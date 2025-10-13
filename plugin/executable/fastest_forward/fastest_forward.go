@@ -72,6 +72,7 @@ type Args struct {
 	ProbeNetwork        string                        `yaml:"probe_network" mapstructure:"probe_network"`                 // defaults to tcp
 	ProbeMaxConcurrency int                           `yaml:"probe_max_concurrency" mapstructure:"probe_max_concurrency"` // defaults to 4
 	ProbeMethod         string                        `yaml:"probe_method" mapstructure:"probe_method"`                   // defaults to tcp
+	CollectTimeout      int                           `yaml:"collect_timeout" mapstructure:"collect_timeout"`             // wait to collect responses (ms); 0 disables
 }
 
 type fastestForward struct {
@@ -87,6 +88,7 @@ type fastestForward struct {
 	probeEnabled    bool
 	probeConcurrent int
 	probeMethod     string
+	collectTimeout  time.Duration
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -104,6 +106,7 @@ func newFastestForward(bp *coremain.BP, args *Args) (*fastestForward, error) {
 		probeTimeout:     getProbeTimeout(args.ProbeTimeout),
 		probeConcurrent:  getProbeConcurrency(args.ProbeMaxConcurrency),
 		probeEnabled:     true,
+		collectTimeout:   getCollectTimeout(args.CollectTimeout),
 		upstreamWrappers: make([]bundled_upstream.Upstream, 0, len(args.Upstream)),
 		upstreamsCloser:  make([]io.Closer, 0, len(args.Upstream)),
 	}
@@ -224,6 +227,13 @@ func getProbeConcurrency(v int) int {
 	return v
 }
 
+func getCollectTimeout(v int) time.Duration {
+	if v <= 0 {
+		return 0
+	}
+	return time.Duration(v) * time.Millisecond
+}
+
 func (f *fastestForward) setProbePort(port int) error {
 	if f.probeMethod == probeMethodICMP {
 		f.probePort = ""
@@ -276,7 +286,15 @@ func (f *fastestForward) Exec(ctx context.Context, qCtx *query_context.Context, 
 }
 
 func (f *fastestForward) exec(ctx context.Context, qCtx *query_context.Context) error {
-	r, err := bundled_upstream.ExchangeParallel(ctx, qCtx, f.upstreamWrappers, f.L())
+	var (
+		r   *dns.Msg
+		err error
+	)
+	if f.collectTimeout > 0 {
+		r, err = f.exchangeCollect(ctx, qCtx)
+	} else {
+		r, err = bundled_upstream.ExchangeParallel(ctx, qCtx, f.upstreamWrappers, f.L())
+	}
 	if err != nil {
 		return err
 	}
@@ -285,6 +303,82 @@ func (f *fastestForward) exec(ctx context.Context, qCtx *query_context.Context) 
 		f.probeResponseLatency(ctx, qCtx, r)
 	}
 	return nil
+}
+
+type collectedResult struct {
+	resp   *dns.Msg
+	err    error
+	source bundled_upstream.Upstream
+}
+
+func (f *fastestForward) exchangeCollect(ctx context.Context, qCtx *query_context.Context) (*dns.Msg, error) {
+	total := len(f.upstreamWrappers)
+	if total == 0 {
+		return nil, bundled_upstream.ErrAllFailed
+	}
+
+	query := qCtx.Q()
+	resultsCh := make(chan *collectedResult, total)
+	for _, u := range f.upstreamWrappers {
+		u := u
+		msgCopy := query.Copy()
+		go func() {
+			resp, err := u.Exchange(ctx, msgCopy)
+			resultsCh <- &collectedResult{
+				resp:   resp,
+				err:    err,
+				source: u,
+			}
+		}()
+	}
+
+	results := make([]*collectedResult, 0, total)
+	timer := time.NewTimer(f.collectTimeout)
+	defer timer.Stop()
+
+collectLoop:
+	for len(results) < total {
+		select {
+		case res := <-resultsCh:
+			results = append(results, res)
+		case <-timer.C:
+			break collectLoop
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+drainLoop:
+	for len(results) < total {
+		select {
+		case res := <-resultsCh:
+			results = append(results, res)
+		default:
+			break drainLoop
+		}
+	}
+
+	for _, res := range results {
+		if res == nil {
+			continue
+		}
+		if res.err != nil {
+			f.L().Warn("upstream err", qCtx.InfoField(), zap.String("addr", res.source.Address()))
+			continue
+		}
+		if res.resp == nil {
+			continue
+		}
+		if res.source.Trusted() || res.resp.Rcode == dns.RcodeSuccess {
+			return res.resp, nil
+		}
+	}
+
+	if len(results) == 0 {
+		return nil, bundled_upstream.ErrAllFailed
+	}
+
+	return nil, bundled_upstream.ErrAllFailed
 }
 
 func (f *fastestForward) probeResponseLatency(ctx context.Context, qCtx *query_context.Context, resp *dns.Msg) {
