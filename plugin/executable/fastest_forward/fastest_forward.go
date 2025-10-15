@@ -308,6 +308,20 @@ type collectedResult struct {
 	ipLatency   time.Duration
 	ipLatencyOK bool
 	bestIP      string
+	latencyDone chan struct{}
+}
+
+func (r *collectedResult) waitLatency(ctx context.Context) bool {
+	if r.latencyDone == nil {
+		return false
+	}
+
+	select {
+	case <-r.latencyDone:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (f *fastestForward) exchangeBest(ctx context.Context, qCtx *query_context.Context) (*dns.Msg, error) {
@@ -323,22 +337,23 @@ func (f *fastestForward) exchangeBest(ctx context.Context, qCtx *query_context.C
 		msgCopy := query.Copy()
 		go func() {
 			resp, err := u.Exchange(ctx, msgCopy)
-			var (
-				latency  time.Duration
-				bestIP   string
-				measured bool
-			)
+			res := &collectedResult{
+				resp:   resp,
+				err:    err,
+				source: u,
+			}
 			if err == nil && resp != nil && f.probeEnabled {
-				latency, bestIP, measured = f.measureResponseLatency(ctx, qCtx, resp)
+				done := make(chan struct{})
+				res.latencyDone = done
+				go func(respMsg *dns.Msg) {
+					latency, bestIP, measured := f.measureResponseLatency(ctx, qCtx, respMsg)
+					res.ipLatency = latency
+					res.ipLatencyOK = measured
+					res.bestIP = bestIP
+					close(done)
+				}(resp)
 			}
-			resultsCh <- &collectedResult{
-				resp:        resp,
-				err:         err,
-				source:      u,
-				ipLatency:   latency,
-				ipLatencyOK: measured,
-				bestIP:      bestIP,
-			}
+			resultsCh <- res
 		}()
 	}
 
@@ -416,16 +431,34 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 		if res.resp == nil {
 			continue
 		}
-		if !res.source.Trusted() && res.resp.Rcode != dns.RcodeSuccess {
-			continue
-		}
-
 		if !f.probeEnabled {
 			if fallbackResp == nil {
 				fallbackResp = res.resp
 				fallbackSource = res.source
 			}
 			continue
+		}
+
+		ready := res.waitLatency(ctx)
+		if res.latencyDone != nil {
+			if ready {
+				if res.ipLatencyOK {
+					f.L().Debug("probe measurement complete", qCtx.InfoField(),
+						zap.String("addr", res.source.Address()),
+						zap.String("ip", res.bestIP),
+						zap.Duration("ip_latency", res.ipLatency),
+					)
+				} else {
+					f.L().Debug("probe measurement unavailable", qCtx.InfoField(),
+						zap.String("addr", res.source.Address()),
+						zap.String("reason", "no latency measured"),
+					)
+				}
+			} else {
+				f.L().Debug("probe wait timeout", qCtx.InfoField(),
+					zap.String("addr", res.source.Address()),
+				)
+			}
 		}
 
 		if res.ipLatencyOK {
