@@ -308,6 +308,7 @@ type collectedResult struct {
 	ipLatency   time.Duration
 	ipLatencyOK bool
 	bestIP      string
+	probeReason string
 	latencyDone chan struct{}
 }
 
@@ -346,10 +347,11 @@ func (f *fastestForward) exchangeBest(ctx context.Context, qCtx *query_context.C
 				done := make(chan struct{})
 				res.latencyDone = done
 				go func(respMsg *dns.Msg) {
-					latency, bestIP, measured := f.measureResponseLatency(ctx, qCtx, respMsg)
+					latency, bestIP, measured, reason := f.measureResponseLatency(ctx, qCtx, respMsg)
 					res.ipLatency = latency
 					res.ipLatencyOK = measured
 					res.bestIP = bestIP
+					res.probeReason = reason
 					close(done)
 				}(resp)
 			}
@@ -418,6 +420,7 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 		bestIP         string
 		fallbackResp   *dns.Msg
 		fallbackSource bundled_upstream.Upstream
+		fallbackReason string
 	)
 
 	for _, res := range results {
@@ -435,6 +438,7 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 			if fallbackResp == nil {
 				fallbackResp = res.resp
 				fallbackSource = res.source
+				fallbackReason = "probing disabled"
 			}
 			continue
 		}
@@ -449,14 +453,25 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 						zap.Duration("ip_latency", res.ipLatency),
 					)
 				} else {
+					reason := res.probeReason
+					if reason == "" {
+						reason = "no latency measured"
+					}
+					res.probeReason = reason
 					f.L().Debug("probe measurement unavailable", qCtx.InfoField(),
 						zap.String("addr", res.source.Address()),
-						zap.String("reason", "no latency measured"),
+						zap.String("reason", reason),
 					)
 				}
 			} else {
+				reason := res.probeReason
+				if reason == "" {
+					reason = "probe timeout"
+				}
+				res.probeReason = reason
 				f.L().Debug("probe wait timeout", qCtx.InfoField(),
 					zap.String("addr", res.source.Address()),
+					zap.String("reason", reason),
 				)
 			}
 		}
@@ -475,6 +490,9 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 		if !bestMeasured && fallbackResp == nil {
 			fallbackResp = res.resp
 			fallbackSource = res.source
+			if res.probeReason != "" {
+				fallbackReason = res.probeReason
+			}
 		}
 	}
 
@@ -495,6 +513,9 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 				qCtx.InfoField(),
 				zap.String("addr", fallbackSource.Address()),
 			}
+			if fallbackReason != "" {
+				logFields = append(logFields, zap.String("reason", fallbackReason))
+			}
 			f.L().Debug("selected response without IP latency measurement", logFields...)
 		}
 		return fallbackResp, nil
@@ -503,14 +524,14 @@ func (f *fastestForward) selectBestResponse(ctx context.Context, qCtx *query_con
 	return nil, bundled_upstream.ErrAllFailed
 }
 
-func (f *fastestForward) measureResponseLatency(ctx context.Context, qCtx *query_context.Context, resp *dns.Msg) (time.Duration, string, bool) {
+func (f *fastestForward) measureResponseLatency(ctx context.Context, qCtx *query_context.Context, resp *dns.Msg) (time.Duration, string, bool, string) {
 	if !f.probeEnabled || resp == nil {
-		return 0, "", false
+		return 0, "", false, ""
 	}
 
 	ips := collectResponseIPs(resp)
 	if len(ips) == 0 {
-		return 0, "", false
+		return 0, "", false, ""
 	}
 
 	probeCtx := ctx
@@ -528,17 +549,18 @@ func (f *fastestForward) measureResponseLatency(ctx context.Context, qCtx *query
 	type ipLatencyResult struct {
 		ip      string
 		latency time.Duration
+		ok      bool
+		reason  string
 	}
 
 	latencyCh := make(chan ipLatencyResult, len(ips))
 	for _, ip := range ips {
 		ip := ip
 		g.Go(func() error {
-			if latency, ok := f.calcIPLatency(gctx, qCtx, ip, false); ok {
-				select {
-				case latencyCh <- ipLatencyResult{ip: ip, latency: latency}:
-				default:
-				}
+			latency, ok, reason := f.calcIPLatency(gctx, qCtx, ip, false)
+			select {
+			case latencyCh <- ipLatencyResult{ip: ip, latency: latency, ok: ok, reason: reason}:
+			default:
 			}
 			return nil
 		})
@@ -552,19 +574,30 @@ func (f *fastestForward) measureResponseLatency(ctx context.Context, qCtx *query
 	}
 
 	var (
-		bestLatency time.Duration
-		bestIP      string
-		hasLatency  bool
+		bestLatency    time.Duration
+		bestIP         string
+		hasLatency     bool
+		fallbackReason string
 	)
 	for res := range latencyCh {
-		if !hasLatency || res.latency < bestLatency {
-			bestLatency = res.latency
-			bestIP = res.ip
-			hasLatency = true
+		if res.ok {
+			if !hasLatency || res.latency < bestLatency {
+				bestLatency = res.latency
+				bestIP = res.ip
+				hasLatency = true
+			}
+			continue
+		}
+		if fallbackReason == "" {
+			fallbackReason = res.reason
 		}
 	}
 
-	return bestLatency, bestIP, hasLatency
+	if !hasLatency && fallbackReason == "" {
+		fallbackReason = "no latency measured"
+	}
+
+	return bestLatency, bestIP, hasLatency, fallbackReason
 }
 
 func (f *fastestForward) probeResponseLatency(ctx context.Context, qCtx *query_context.Context, resp *dns.Msg) {
@@ -592,7 +625,7 @@ func (f *fastestForward) probeResponseLatency(ctx context.Context, qCtx *query_c
 	for _, ip := range ips {
 		ip := ip
 		g.Go(func() error {
-			_, _ = f.calcIPLatency(gctx, qCtx, ip, true)
+			_, _, _ = f.calcIPLatency(gctx, qCtx, ip, true)
 			return nil
 		})
 	}
@@ -602,68 +635,89 @@ func (f *fastestForward) probeResponseLatency(ctx context.Context, qCtx *query_c
 	}
 }
 
-func (f *fastestForward) calcIPLatency(ctx context.Context, qCtx *query_context.Context, ip string, withLog bool) (time.Duration, bool) {
+func (f *fastestForward) calcIPLatency(ctx context.Context, qCtx *query_context.Context, ip string, withLog bool) (time.Duration, bool, string) {
 	if f.probeMethod == probeMethodICMP {
 		return f.calcICMPLatency(ctx, qCtx, ip, withLog)
 	}
 
-	if latency, ok := f.calcDialLatency(ctx, qCtx, ip, withLog); ok {
-		return latency, true
-	}
-
-	if f.probeMethod != probeMethodICMP {
-		select {
-		case <-ctx.Done():
-			return 0, false
-		default:
+	if latency, ok, reason := f.calcDialLatency(ctx, qCtx, ip, withLog); ok {
+		return latency, true, ""
+	} else {
+		if f.probeMethod != probeMethodICMP {
+			select {
+			case <-ctx.Done():
+				return 0, false, reason
+			default:
+			}
+			if withLog {
+				f.L().Debug("latency probe falling back to icmp", qCtx.InfoField(), zap.String("ip", ip))
+			}
+			icmpLatency, icmpOK, icmpReason := f.calcICMPLatency(ctx, qCtx, ip, withLog)
+			if icmpOK {
+				return icmpLatency, true, ""
+			}
+			if reason == "" {
+				reason = icmpReason
+			} else if icmpReason != "" {
+				reason = reason + "; " + icmpReason
+			}
+			return 0, false, reason
 		}
-		if withLog {
-			f.L().Debug("latency probe falling back to icmp", qCtx.InfoField(), zap.String("ip", ip))
-		}
-		return f.calcICMPLatency(ctx, qCtx, ip, withLog)
+		return 0, false, reason
 	}
-
-	return 0, false
 }
 
-func (f *fastestForward) calcDialLatency(ctx context.Context, qCtx *query_context.Context, ip string, withLog bool) (time.Duration, bool) {
+func (f *fastestForward) calcDialLatency(ctx context.Context, qCtx *query_context.Context, ip string, withLog bool) (time.Duration, bool, string) {
 	addr := net.JoinHostPort(ip, f.probePort)
 	start := time.Now()
 	conn, err := (&net.Dialer{}).DialContext(ctx, f.probeNetwork, addr)
 	if err != nil {
-		if withLog {
-			f.logDialFailure(ctx, qCtx, ip, err)
-		}
-		return 0, false
+		reason := f.logDialFailure(ctx, qCtx, ip, err, withLog)
+		return 0, false, reason
 	}
 	latency := time.Since(start)
 	conn.Close()
 	if withLog {
 		f.L().Info("latency probe success", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip), zap.Duration("latency", latency))
 	}
-	return latency, true
+	return latency, true, ""
 }
 
-func (f *fastestForward) logDialFailure(ctx context.Context, qCtx *query_context.Context, ip string, err error) {
+func (f *fastestForward) logDialFailure(ctx context.Context, qCtx *query_context.Context, ip string, err error, withLog bool) string {
+	reason := describeDialError(err)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		f.L().Debug("latency probe timeout", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip))
-		return
+		reason = "probe timeout"
+		if withLog {
+			f.L().Debug("latency probe timeout", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip))
+		}
+		return reason
 	}
 	select {
 	case <-ctx.Done():
-		f.L().Debug("latency probe canceled", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip), zap.Error(err))
+		if reason == "" {
+			reason = "probe canceled"
+		}
+		if withLog {
+			f.L().Debug("latency probe canceled", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip), zap.String("reason", reason), zap.Error(err))
+		}
 	default:
-		f.L().Debug("latency probe failed", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip), zap.Error(err))
+		if reason == "" {
+			reason = err.Error()
+		}
+		if withLog {
+			f.L().Debug("latency probe failed", qCtx.InfoField(), zap.String("method", f.probeMethod), zap.String("ip", ip), zap.String("reason", reason), zap.Error(err))
+		}
 	}
+	return reason
 }
 
-func (f *fastestForward) calcICMPLatency(ctx context.Context, qCtx *query_context.Context, ip string, withLog bool) (time.Duration, bool) {
+func (f *fastestForward) calcICMPLatency(ctx context.Context, qCtx *query_context.Context, ip string, withLog bool) (time.Duration, bool, string) {
 	pinger, err := ping.NewPinger(ip)
 	if err != nil {
 		if withLog {
 			f.L().Debug("latency probe init failed", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.Error(err))
 		}
-		return 0, false
+		return 0, false, err.Error()
 	}
 	pinger.Count = 1
 	pinger.SetPrivileged(false)
@@ -685,24 +739,33 @@ func (f *fastestForward) calcICMPLatency(ctx context.Context, qCtx *query_contex
 	case <-ctx.Done():
 		pinger.Stop()
 		runErr := <-errCh
+		reason := "probe canceled"
 		if withLog {
 			if runErr != nil && !errors.Is(runErr, context.Canceled) {
-				f.L().Debug("latency probe canceled", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.Error(runErr))
+				reason = describeICMPErr(runErr)
+				f.L().Debug("latency probe canceled", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.String("reason", reason), zap.Error(runErr))
 			} else {
-				f.L().Debug("latency probe canceled", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip))
+				f.L().Debug("latency probe canceled", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.String("reason", reason))
 			}
 		}
-		return 0, false
+		return 0, false, reason
 	case err := <-errCh:
 		if err != nil {
+			reason := describeICMPErr(err)
 			if withLog {
 				if errors.Is(err, context.DeadlineExceeded) {
 					f.L().Debug("latency probe timeout", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip))
 				} else {
-					f.L().Debug("latency probe failed", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.Error(err))
+					f.L().Debug("latency probe failed", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.String("reason", reason), zap.Error(err))
 				}
 			}
-			return 0, false
+			if errors.Is(err, context.DeadlineExceeded) && reason == "" {
+				reason = "icmp timeout"
+			}
+			if reason == "" {
+				reason = err.Error()
+			}
+			return 0, false, reason
 		}
 	}
 
@@ -716,7 +779,7 @@ func (f *fastestForward) calcICMPLatency(ctx context.Context, qCtx *query_contex
 		if withLog {
 			f.L().Debug("latency probe failed", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.String("reason", "no reply"))
 		}
-		return 0, false
+		return 0, false, "no reply"
 	}
 
 	latency := stats.AvgRtt
@@ -727,13 +790,48 @@ func (f *fastestForward) calcICMPLatency(ctx context.Context, qCtx *query_contex
 		if withLog {
 			f.L().Debug("latency probe failed", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.String("reason", "invalid rtt"))
 		}
-		return 0, false
+		return 0, false, "invalid rtt"
 	}
 
 	if withLog {
 		f.L().Info("latency probe success", qCtx.InfoField(), zap.String("method", probeMethodICMP), zap.String("ip", ip), zap.Duration("latency", latency))
 	}
-	return latency, true
+	return latency, true, ""
+}
+
+func describeDialError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if ne, ok := err.(net.Error); ok {
+		if ne.Timeout() {
+			return "dial timeout"
+		}
+		if ne.Temporary() {
+			return "temporary network error"
+		}
+	}
+	if opErr, ok := err.(*net.OpError); ok {
+		if opErr.Err != nil {
+			return opErr.Err.Error()
+		}
+	}
+	return err.Error()
+}
+
+func describeICMPErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	if ne, ok := err.(net.Error); ok {
+		if ne.Timeout() {
+			return "icmp timeout"
+		}
+		if ne.Temporary() {
+			return "temporary network error"
+		}
+	}
+	return err.Error()
 }
 
 func collectResponseIPs(resp *dns.Msg) []string {
